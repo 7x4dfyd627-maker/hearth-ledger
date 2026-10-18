@@ -1608,7 +1608,7 @@ function annualStatement(properties, income, expenses) {
 }
 
 /* ---------- More tab ---------- */
-function MoreTab({ properties, tenants, income, expenses, currency, setCurrency, openProperty, openTenant, updateWorkbook, exportBackup, importBackup, portableCopy, copyBackup, importClipboard }) {
+function MoreTab({ properties, tenants, income, expenses, currency, setCurrency, openProperty, openTenant, updateWorkbook, exportBackup, importBackup, portableCopy, copyBackup, importClipboard, importUtilitiesOnly }) {
   return h(Screen, { title: 'More' },
     h(Group, { title: 'PROPERTIES' },
       properties.map(p => h(Row, { key: p.id, label: p.name, sub: p.address || null, onClick: () => openProperty(p), chevron: true })),
@@ -1641,6 +1641,12 @@ function MoreTab({ properties, tenants, income, expenses, currency, setCurrency,
       h(Row, { label: 'Save Portable Copy', sub: 'This app as one HTML file with data inside', onClick: portableCopy, chevron: true }),
       h(Row, { label: 'Copy Backup to Clipboard', sub: 'Fallback: paste into Notes or a file', onClick: copyBackup, chevron: true }),
       h(Row, { label: 'Import from Clipboard', sub: 'Restore from copied backup text', onClick: importClipboard, chevron: true }),
+      h('label', { className: 'row row-tap' },
+        h('div', { className: 'row-main' },
+          h('div', { className: 'row-label' }, 'Import DEWA Only'),
+          h('div', { className: 'row-sub' }, 'Adds bills and accounts, leaves rent and tenants alone')),
+        h('div', { className: 'chevron' }, '\u203a'),
+        h('input', { type: 'file', accept: '.json,application/json', style: { display: 'none' }, onChange: importUtilitiesOnly })),
       h(FRow, { label: 'Currency' }, h(FSelect, { value: currency, onChange: e => setCurrency(e.target.value) },
         ['AED', 'PKR', 'USD', 'EUR', 'GBP', 'SAR', 'INR'].map(c => Opt(c))))),
     h(Group, { footer: 'Hearth & Ledger \u00b7 iOS edition v3.0 \u00b7 data is stored on this device; back up regularly.' }));
@@ -1842,6 +1848,57 @@ function App() {
 
   const book = useMemo(() => buildBook(tenants, income, todayISO()), [tenants, income]);
   const util = useMemo(() => buildUtility(utilAccounts, utilBills), [utilAccounts, utilBills]);
+
+  /* Merge only DEWA accounts and bills. Rent, tenants, properties and expenses
+     are never read or written here, so nothing else on the device can change. */
+  const importUtilitiesOnly = async ev => {
+    const file = ev.target.files && ev.target.files[0];
+    ev.target.value = '';
+    if (!file) return;
+    try {
+      const d = JSON.parse(await file.text());
+      const inAcc = d.utilAccounts || [], inBills = d.utilBills || [];
+      if (!inAcc.length) throw new Error('no DEWA accounts found in this file');
+
+      /* re-point each account at the matching property on THIS device */
+      const srcProps = d.properties || [];
+      const resolve = a => {
+        if (properties.some(p => p.id === a.propertyId)) return a.propertyId;
+        const was = srcProps.find(p => p.id === a.propertyId);
+        if (was) { const hit = properties.find(p => p.name === was.name); if (hit) return hit.id; }
+        return '';
+      };
+
+      const accs = utilAccounts.slice();
+      const bills = utilBills.slice();
+      let added = 0, replaced = 0, orphan = 0;
+
+      inAcc.forEach(a => {
+        const pid = resolve(a);
+        if (!pid) orphan++;
+        const existing = accs.find(x => (a.accountNo && x.accountNo === a.accountNo) || x.id === a.id);
+        const id = existing ? existing.id : (a.id || uid());
+        const rec = Object.assign({}, a, { id: id, propertyId: pid || a.propertyId || '' });
+        if (existing) { accs[accs.indexOf(existing)] = rec; replaced++; }
+        else { accs.push(rec); added++; }
+        /* this account's months are replaced wholesale, other accounts untouched */
+        const keep = bills.filter(b => b.accountId !== id);
+        bills.length = 0; keep.forEach(b => bills.push(b));
+        inBills.filter(b => b.accountId === a.id).forEach(b =>
+          bills.push(Object.assign({}, b, { id: b.id || uid(), accountId: id })));
+      });
+
+      if (!confirm('Import ' + inAcc.length + ' DEWA account' + (inAcc.length === 1 ? '' : 's') +
+        ' and ' + inBills.length + ' bill months?\n\nRent, tenants and expenses will not be touched.')) return;
+
+      setList('utilAccounts', accs);
+      setList('utilBills', bills);
+      if (d.dealer) { setDealer(d.dealer); saveK(K.DL, d.dealer); }
+      alert('DEWA data imported.' + (added ? '\n' + added + ' account(s) added.' : '') +
+        (replaced ? '\n' + replaced + ' account(s) updated.' : '') +
+        (orphan ? '\n' + orphan + ' could not be matched to a property \u2014 set it under DEWA \u2192 Edit account.' : ''));
+    } catch (err) { alert('DEWA import failed: ' + err.message); }
+  };
   const saveBill = rec => setList('utilBills', utilBills.some(b => b.id === rec.id) ? utilBills.map(b => b.id === rec.id ? rec : b) : utilBills.concat([rec]));
   const saveAccount = rec => setList('utilAccounts', utilAccounts.some(a => a.id === rec.id) ? utilAccounts.map(a => a.id === rec.id ? rec : a) : utilAccounts.concat([rec]));
   const deleteAccount = id => { setList('utilAccounts', utilAccounts.filter(a => a.id !== id)); setList('utilBills', utilBills.filter(b => b.accountId !== id)); };
@@ -1967,7 +2024,7 @@ function App() {
       focus: billFocus, setFocus: setBillFocus,
       openBill: b => setBillSheet(b), openAccount: a => setAcctSheet(a || {}) }) :
     tab === 'ledger' ? h(Ledger, { properties, tenants, income, expenses, book, openNew: () => setEntrySheet({ kind: 'income', initial: null }), openEntry: (kind, e) => setEntrySheet({ kind, initial: e }) }) :
-    h(MoreTab, { properties, tenants, income, expenses, currency, setCurrency,
+    h(MoreTab, { importUtilitiesOnly, properties, tenants, income, expenses, currency, setCurrency,
       openProperty: p => { setPropEditing(p); setPropSheet(true); },
       openTenant: t => { setTenEditing(t); setTenSheet(true); },
       updateWorkbook, exportBackup, importBackup, portableCopy, copyBackup, importClipboard });
